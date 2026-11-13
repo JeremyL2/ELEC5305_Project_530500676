@@ -1,0 +1,12 @@
+# Install the matched CPU torch trio first; see README.md (Python 3.10).
+torch==2.6.0+cpu
+torchvision==0.21.0+cpu
+torchaudio==2.6.0+cpu
+fastai==2.7.19
+fastcore==1.7.29
+fastprogress==1.0.3
+numpy==1.26.4
+soundfile==0.13.1
+pandas==2.2.3
+scikit-learn==1.6.1
+matplotlib==3.10.1

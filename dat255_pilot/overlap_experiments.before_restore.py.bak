@@ -1,0 +1,451 @@
+"""Frozen DAT255 overlap experiments.
+
+Waveforms are synthesized on demand. Prediction caching and a CSV journal make
+the long experiment resumable without storing thousands of 94-second WAVs.
+"""
+import argparse
+import csv
+from functools import lru_cache
+import importlib.metadata
+from itertools import combinations
+import json
+from pathlib import Path
+import time
+
+import numpy as np
+import pandas as pd
+import psutil
+import soundfile as sf
+import torch
+from sklearn.metrics import f1_score
+
+import dat255_cpu as cpu
+
+HERE = Path(__file__).resolve().parent
+OUTPUT = HERE / "overlap_results"
+RATIOS = (-12, -6, 0, 6, 12)
+FRACTIONS = (0, .25, .5, .75, 1)
+FADE_SAMPLES = 640  # 20 ms at 32 kHz, only for partial-window additions.
+THRESHOLD = .5
+RECIPE_VERSION = 1
+
+
+def ac_stats(x):
+    values = x.double()
+    mean = values.mean().item()
+    rms = values.std(unbiased=False).item()
+    if rms <= 1e-12 or not np.isfinite(rms):
+        raise ValueError("No finite varying acoustic component")
+    return mean, rms
+
+
+@lru_cache(maxsize=32)
+def layout(n, fraction, position):
+    length = int(round(n * fraction))
+    if position not in ("onset", "centre", "end") or not 0 <= fraction <= 1:
+        raise ValueError("Invalid overlap geometry")
+    start = {"onset": 0, "centre": (n - length) // 2, "end": n - length}[position]
+    weights = torch.ones((1, length), dtype=torch.float32)
+    if 0 < length < n:
+        fade = min(FADE_SAMPLES, length // 2)
+        ramp = .5 - .5 * torch.cos(torch.linspace(0, np.pi, fade))
+        weights[:, :fade] = ramp
+        weights[:, -fade:] = ramp.flip(0)
+    return start, length, weights
+
+
+def place_fragment(source, fraction, position):
+    """Move the SAME centred B fragment to each placement; never repeat it."""
+    n = source.shape[1]
+    start, length, weights = layout(n, fraction, position)
+    fragment_start = (n - length) // 2
+    fragment = source[:, fragment_start:fragment_start + length]
+    result = torch.zeros_like(source)
+    if length:
+        result[:, start:start + length] = fragment * weights
+    return result
+
+
+def conditions(source_table):
+    pairs = [(a, b) for a, b in combinations(range(len(source_table)), 2)
+             if source_table.iloc[a]["class"] != source_table.iloc[b]["class"]]
+    scenes = []
+    pair_counts, examples = {}, {}
+    for a, b in pairs:
+        pair_class = " + ".join(sorted([source_table.iloc[a]["class"], source_table.iloc[b]["class"]]))
+        pair_counts[pair_class] = pair_counts.get(pair_class, 0) + 1
+        examples.setdefault(pair_class, (a, b))
+        for ratio in RATIOS:
+            scenes.append(dict(family="level", a=a, b=b, sir_db=ratio, fraction=1., position="centre", pair_class=pair_class))
+        # Alternate roles within each class pair, fixed before scoring mixtures.
+        reference, added = (a, b) if pair_counts[pair_class] % 2 else (b, a)
+        for fraction in FRACTIONS:
+            scenes.append(dict(family="duration", a=reference, b=added, sir_db=0,
+                               fraction=float(fraction), position="centre", pair_class=pair_class))
+    for pair_class, (a, b) in examples.items():
+        for reference, added in ((a, b), (b, a)):
+            for fraction in (.25, .5, .75):
+                for position in ("onset", "centre", "end"):
+                    scenes.append(dict(family="placement", a=reference, b=added, sir_db=0,
+                                       fraction=fraction, position=position, pair_class=pair_class))
+    for index, scene in enumerate(scenes):
+        scene["scenario_id"] = f"scene_{index:05d}"
+    return scenes
+
+
+class Experiment:
+    def __init__(self, output, threads=8):
+        self.output = Path(output)
+        self.output.mkdir(parents=True, exist_ok=True)
+        torch.set_num_threads(threads)
+        torch.manual_seed(0)
+        self.threads = threads
+        self.learn, self.names = cpu.load_classifier(cpu.ROOT / "DAT255/models/resnet50-93")
+        self.learn.model.requires_grad_(False)
+        self.process = psutil.Process()
+        self.inferences, self.max_rss = 0, 0
+        self.table = pd.read_csv(HERE / "results/inventory.csv", keep_default_na=False)
+        self.table = self.table[(self.table.requires_repetition == False) & (self.table.error == "")].copy()
+        self.table = self.table.sort_values("recording_id").reset_index(drop=True)
+        if len(self.table) != 27 or set(self.table["class"]) != set(self.names):
+            raise ValueError("This preregistered design expects the 27 native-length pilot sources")
+        # About 325 MB of source audio; all model calls still use batch size one.
+        self.audio, self.info, self.original_predictions = [], [], []
+        for record in self.table.to_dict("records"):
+            path = cpu.ROOT / "DeepShip" / record["recording_id"]
+            if cpu.sha256(path) != record["file_sha256"]:
+                raise ValueError(f"Source changed since inventory: {path}")
+            wave, crop = cpu.read_window(path)
+            if crop["requires_repetition"]:
+                raise ValueError("No repetition permitted in this experiment")
+            mean, rms = ac_stats(wave)
+            self.audio.append(wave / rms)
+            self.info.append({**record, **crop, "dc_mean": mean, "ac_rms": rms,
+                              "dc_energy_fraction": mean * mean / (mean * mean + rms * rms),
+                              "unit_dc_mean": mean / rms, "unit_peak": float((wave / rms).abs().max())})
+        self.scenes = conditions(self.table)
+        self.geometry_cache = {}
+        self.fragment_stats, self.segment_rms = {}, {}
+        maximum = 0.
+        for scene in self.scenes:
+            geometry = self.geometry(scene)
+            maximum = max(maximum, self.info[scene["a"]]["unit_peak"] +
+                          geometry["gain_b"] * geometry["fragment_peak"])
+        self.headroom = .90 / maximum  # One constant shared by EVERY signal/control.
+        recipe = {"recipe_version": RECIPE_VERSION, "script_sha256": cpu.sha256(Path(__file__)),
+                  "adapter_sha256": cpu.sha256(Path(cpu.__file__)),
+                  "checkpoint_sha256": cpu.sha256(cpu.ROOT / "DAT255/models/resnet50-93"),
+                  "source_hashes": self.table.set_index("recording_id").file_sha256.to_dict(),
+                  "class_names": self.names, "ratios_db": list(RATIOS), "fractions": list(FRACTIONS),
+                  "fade_samples": FADE_SAMPLES, "headroom": self.headroom, "threads": threads,
+                  "threshold": THRESHOLD, "sample_rate": cpu.SAMPLE_RATE, "window_samples": cpu.WINDOW_SAMPLES}
+        config_path = self.output / "recipe.json"
+        if config_path.exists() and json.loads(config_path.read_text()) != recipe:
+            raise ValueError("Recipe/source/model changed: use a new results directory")
+        cpu.save_json(config_path, recipe)
+        self.cache = {}
+        self.undefined_controls = set()
+        cache_path = self.output / "prediction_cache.csv"
+        if cache_path.exists():
+            for row in pd.read_csv(cache_path).to_dict("records"):
+                self.cache[row["key"]] = np.array([row[f"score_{name}"] for name in self.names])
+                if str(row.get("status", "ok")) != "ok":
+                    self.undefined_controls.add(row["key"])
+        self.cache_file = cache_path.open("a", newline="", encoding="utf-8")
+        self.cache_writer = csv.DictWriter(self.cache_file, fieldnames=["key", "status"] + [f"score_{name}" for name in self.names])
+        if cache_path.stat().st_size == 0:
+            self.cache_writer.writeheader()
+
+    def geometry(self, scene):
+        a, b, fraction, position = scene["a"], scene["b"], scene["fraction"], scene["position"]
+        key = (a, b, fraction, position, scene["sir_db"])
+        if key in self.geometry_cache:
+            return self.geometry_cache[key]
+        start, length, weights = layout(cpu.WINDOW_SAMPLES, fraction, position)
+        if length == 0:
+            result = dict(start=start, length=0, gain_b=0., fragment_mean=0., fragment_peak=0., active_sir_db=None)
+        else:
+            fragment_start = (cpu.WINDOW_SAMPLES - length) // 2
+            fragment = self.audio[b][:, fragment_start:fragment_start + length]
+            if (b, fraction) not in self.fragment_stats:
+                mean_b, _ = ac_stats(fragment)
+                rms_b = float(torch.sqrt(torch.mean(((fragment.double() - mean_b) * weights.double()) ** 2)))
+                self.fragment_stats[b, fraction] = mean_b, rms_b, float(fragment.abs().max())
+            mean_b, rms_b, fragment_peak = self.fragment_stats[b, fraction]
+            if (a, fraction, position) not in self.segment_rms:
+                self.segment_rms[a, fraction, position] = ac_stats(self.audio[a][:, start:start + length])[1]
+            rms_a = self.segment_rms[a, fraction, position]
+            gain_b = 10 ** (-scene["sir_db"] / 20) if fraction == 1 else rms_a / rms_b * 10 ** (-scene["sir_db"] / 20)
+            result = dict(start=start, length=length, gain_b=gain_b, fragment_mean=mean_b,
+                          fragment_peak=fragment_peak,
+                          active_sir_db=20 * np.log10(rms_a / (gain_b * rms_b)))
+        self.geometry_cache[key] = result
+        return result
+
+    def predict(self, key, wave, allow_undefined=False):
+        key = json.dumps(key, separators=(",", ":"))
+        if key in self.cache:
+            return self.cache[key]
+        if wave.shape != (1, cpu.WINDOW_SAMPLES) or not torch.isfinite(wave).all():
+            raise ValueError("Invalid synthetic waveform")
+        status = "ok"
+        try:
+            with torch.inference_mode():
+                spec = cpu.wavToSpecs(wave, (cpu.WINDOW_SAMPLES - cpu.HF_SAMPLES) // 2)
+                result = self.learn.model(cpu.model_input(self.learn, spec)).sigmoid()[0].cpu().numpy().copy()
+            self.inferences += 1
+        except ValueError as error:
+            if not allow_undefined or "Constant/non-finite spectrogram" not in str(error):
+                raise
+            # A masked solo can have a completely silent HF crop. Original
+            # normalization is then undefined. Record missing control scores;
+            # never manufacture background/noise to make this control valid.
+            result = np.full(4, np.nan)
+            status = "undefined_silent_spectrogram_control"
+            self.undefined_controls.add(key)
+        if result.shape != (4,) or (status == "ok" and not np.isfinite(result).all()):
+            raise ValueError("Invalid classifier scores")
+        self.cache[key] = result
+        self.cache_writer.writerow({"key": key, "status": status, **dict(zip([f"score_{n}" for n in self.names], result.tolist()))})
+        self.cache_file.flush()
+        self.max_rss = max(self.max_rss, self.process.memory_info().rss)
+        return result
+
+    def signals(self, scene):
+        g = self.geometry(scene)
+        a = self.headroom * self.audio[scene["a"]]
+        b = self.headroom * g["gain_b"] * place_fragment(self.audio[scene["b"]], scene["fraction"], scene["position"])
+        dc_b = torch.zeros_like(a)
+        if g["length"]:
+            weights = layout(cpu.WINDOW_SAMPLES, scene["fraction"], scene["position"])[2]
+            dc_b[:, g["start"]:g["start"] + g["length"]] = self.headroom * g["gain_b"] * g["fragment_mean"] * weights
+        return a, b, dc_b
+
+    def evaluate_scene(self, scene):
+        a_id, b_id = scene["a"], scene["b"]
+        g = self.geometry(scene)
+        # Commutativity makes full 0-dB reverse-role scenes exactly reusable.
+        canonical = scene.copy()
+        swapped = scene["fraction"] == 1 and scene["sir_db"] == 0 and a_id > b_id
+        if swapped:
+            canonical["a"], canonical["b"] = b_id, a_id
+        signature = [canonical[k] for k in ("a", "b", "sir_db", "fraction", "position")]
+        a, b, dc_b = self.signals(canonical)
+        solo_a = self.predict(["solo", canonical["a"], 1.], a)
+        if scene["fraction"] == 0:
+            scores = dict(mixture=solo_a, solo_a=solo_a, dc_a=solo_a, solo_b=None, dc_b=None)
+        else:
+            gain = self.geometry(canonical)["gain_b"]
+            solo_b_key = (["solo", canonical["b"], gain] if scene["fraction"] == 1 else
+                          ["masked_solo", canonical["b"], scene["fraction"], scene["position"], gain])
+            scores = {"mixture": self.predict(["mixture"] + signature, a + b),
+                      "solo_a": solo_a, "solo_b": self.predict(solo_b_key, b, allow_undefined=True),
+                      "dc_a": self.predict(["dc_a"] + signature, a + dc_b),
+                      "dc_b": self.predict(["dc_b"] + signature, b + self.headroom * self.info[canonical["a"]]["unit_dc_mean"], allow_undefined=True)}
+            if swapped:
+                scores["solo_a"], scores["solo_b"] = scores["solo_b"], scores["solo_a"]
+                scores["dc_a"], scores["dc_b"] = scores["dc_b"], scores["dc_a"]
+        n, hf_start = cpu.WINDOW_SAMPLES, (cpu.WINDOW_SAMPLES - cpu.HF_SAMPLES) // 2
+        hf_intersection = max(0, min(g["start"] + g["length"], hf_start + cpu.HF_SAMPLES) - max(g["start"], hf_start))
+        row = {**scene, "source_a": self.table.iloc[a_id].recording_id,
+               "source_b": self.table.iloc[b_id].recording_id,
+               "class_a": self.table.iloc[a_id]["class"], "class_b": self.table.iloc[b_id]["class"],
+               "start_sample": g["start"], "overlap_samples": g["length"],
+               "overlap_seconds": g["length"] / cpu.SAMPLE_RATE,
+               "hf_overlap_fraction": hf_intersection / cpu.HF_SAMPLES,
+               "gain_b": g["gain_b"], "achieved_active_sir_db": g["active_sir_db"],
+               "peak": float((a + b).abs().max()), "repetition": False}
+        if row["peak"] > .90001:
+            raise ValueError("Global headroom bound failed")
+        scores["full_solo_b"] = self.predict(["solo", b_id, 1.], self.headroom * self.audio[b_id])
+        for kind, vector in scores.items():
+            for index, name in enumerate(self.names):
+                row[f"{kind}_{name}"] = float(vector[index]) if vector is not None else None
+        return row
+
+    def baseline(self):
+        rows = []
+        for i, record in enumerate(self.info):
+            original_wave, _ = cpu.read_window(cpu.ROOT / "DeepShip" / record["recording_id"])
+            original = self.predict(["original", i], original_wave)
+            scaled = self.predict(["solo", i, 1.], self.headroom * self.audio[i])
+            rows.append({**record, "source_index": i, "headroom": self.headroom,
+                         "original_argmax": self.names[int(original.argmax())],
+                         "scaled_argmax": self.names[int(scaled.argmax())],
+                         "max_gain_control_score_difference": float(np.abs(original - scaled).max()),
+                         **{f"original_{n}": float(s) for n, s in zip(self.names, original)},
+                         **{f"scaled_{n}": float(s) for n, s in zip(self.names, scaled)}})
+        pd.DataFrame(rows).to_csv(self.output / "source_baseline.csv", index=False)
+        return pd.DataFrame(rows)
+
+    def save_examples(self):
+        chosen = []
+        for pair_class in sorted({s["pair_class"] for s in self.scenes}):
+            chosen.append(next(s for s in self.scenes if s["family"] == "level" and
+                               s["pair_class"] == pair_class and s["sir_db"] == 0))
+        first_pair = chosen[0]
+        chosen += [s for s in self.scenes if s["family"] == "duration" and
+                   {s["a"], s["b"]} == {first_pair["a"], first_pair["b"]} and s["fraction"] in (.25, .5, .75)]
+        folder = self.output / "examples"
+        folder.mkdir(exist_ok=True)
+        rows = []
+        for scene in chosen:
+            a, b, _ = self.signals(scene)
+            name = scene["scenario_id"] + ".wav"
+            sf.write(folder / name, (a + b)[0].numpy(), cpu.SAMPLE_RATE, subtype="FLOAT")
+            rows.append({**scene, "path": f"examples/{name}", "sha256": cpu.sha256(folder / name)})
+        pd.DataFrame(rows).to_csv(folder / "manifest.csv", index=False)
+
+
+def add_outcomes(frame, names):
+    frame = frame.copy()
+    for role in ("a", "b"):
+        index = np.array([names.index(c) for c in frame[f"class_{role}"]])
+        for kind in ("mixture", f"solo_{role}", f"dc_{role}"):
+            frame[f"{kind}_own_{role}"] = frame[[f"{kind}_{name}" for name in names]].to_numpy()[np.arange(len(frame)), index]
+        present = np.ones(len(frame), dtype=bool) if role == "a" else frame.fraction.to_numpy() > 0
+        frame[f"present_{role}"] = present
+        frame[f"clean_detected_{role}"] = present & (frame[f"solo_{role}_own_{role}"] >= THRESHOLD)
+        frame[f"detected_{role}"] = present & (frame[f"mixture_own_{role}"] >= THRESHOLD)
+        frame[f"score_change_{role}"] = frame[f"mixture_own_{role}"] - frame[f"solo_{role}_own_{role}"]
+        frame[f"dc_adjusted_change_{role}"] = frame[f"mixture_own_{role}"] - frame[f"dc_{role}_own_{role}"]
+        frame[f"dc_only_change_{role}"] = frame[f"dc_{role}_own_{role}"] - frame[f"solo_{role}_own_{role}"]
+    target = np.zeros((len(frame), len(names)), dtype=int)
+    for role in ("a", "b"):
+        for i, (name, present) in enumerate(zip(frame[f"class_{role}"], frame[f"present_{role}"])):
+            if present:
+                target[i, names.index(name)] = 1
+    predicted = frame[[f"mixture_{name}" for name in names]].to_numpy() >= THRESHOLD
+    frame["all_present_detected"] = np.all(~target.astype(bool) | predicted, axis=1)
+    frame["exact_match"] = np.all(target == predicted, axis=1)
+    frame["absent_false_positives"] = ((target == 0) & predicted).sum(axis=1)
+    frame["both_clean_detected"] = frame.clean_detected_a & frame.clean_detected_b
+    index_b = np.array([names.index(c) for c in frame.class_b])
+    frame["full_b_own"] = frame[[f"full_solo_b_{n}" for n in names]].to_numpy()[np.arange(len(frame)), index_b]
+    frame["both_full_source_detected"] = (frame.fraction > 0) & frame.clean_detected_a & (frame.full_b_own >= THRESHOLD)
+    return frame
+
+
+def summarize_group(group, names):
+    true = np.zeros((len(group), len(names)), dtype=int)
+    for role in ("a", "b"):
+        for i, (name, present) in enumerate(zip(group[f"class_{role}"], group[f"present_{role}"])):
+            if present:
+                true[i, names.index(name)] = 1
+    pred = group[[f"mixture_{name}" for name in names]].to_numpy() >= THRESHOLD
+    conditional = group[group.both_clean_detected]
+    full_conditional = group[group.both_full_source_detected]
+    denominator = int(group.clean_detected_a.sum() + group.clean_detected_b.sum())
+    retained = int((group.clean_detected_a & group.detected_a).sum() + (group.clean_detected_b & group.detected_b).sum())
+    role_metrics = {}
+    for role in ("a", "b"):
+        eligible = group[group[f"present_{role}"]]
+        clean = eligible[eligible[f"clean_detected_{role}"]]
+        role_metrics.update({f"recall_{role}": float(eligible[f"detected_{role}"].mean()) if len(eligible) else np.nan,
+                             f"matched_control_coverage_{role}": float(eligible[f"solo_{role}_own_{role}"].notna().mean()) if len(eligible) else np.nan,
+                             f"retention_{role}": float(clean[f"detected_{role}"].mean()) if len(clean) else np.nan,
+                             f"score_change_{role}": float(eligible[f"score_change_{role}"].mean()),
+                             f"dc_adjusted_change_{role}": float(eligible[f"dc_adjusted_change_{role}"].mean()),
+                             f"dc_only_change_{role}": float(eligible[f"dc_only_change_{role}"].mean())})
+    return {"n_scenarios": len(group), "all_present_recall": float(group.all_present_detected.mean()),
+            "exact_match": float(group.exact_match.mean()), "macro_f1": f1_score(true, pred, average="macro", zero_division=0),
+            "mean_absent_false_positives": float(group.absent_false_positives.mean()),
+            "retention_all": retained / denominator if denominator else np.nan,
+            "n_both_clean_detected": len(conditional),
+            "both_recall_conditional": float(conditional.all_present_detected.mean()) if len(conditional) else np.nan,
+            "exact_match_conditional": float(conditional.exact_match.mean()) if len(conditional) else np.nan,
+            "n_both_full_source_detected": len(full_conditional),
+            "both_recall_full_source_conditional": float(full_conditional.all_present_detected.mean()) if len(full_conditional) else np.nan,
+            **role_metrics}
+
+
+def summarize(output=OUTPUT):
+    output = Path(output)
+    names = json.loads((output / "recipe.json").read_text())["class_names"]
+    frame = add_outcomes(pd.read_csv(output / "scenarios.csv"), names)
+    frame.to_csv(output / "outcomes.csv", index=False)
+    tables = {}
+    for family, grouping in (("level", ["sir_db"]), ("duration", ["fraction"]),
+                              ("placement", ["fraction", "position"])):
+        rows = []
+        for key, group in frame[frame.family == family].groupby(grouping):
+            keys = key if isinstance(key, tuple) else (key,)
+            rows.append({**dict(zip(grouping, keys)), **summarize_group(group, names)})
+        table = pd.DataFrame(rows)
+        table.to_csv(output / f"summary_{family}.csv", index=False)
+        tables[family] = table
+    rows = []
+    for (family, ratio, fraction, pair_class), group in frame.groupby(["family", "sir_db", "fraction", "pair_class"]):
+        rows.append({"family": family, "sir_db": ratio, "fraction": fraction, "pair_class": pair_class,
+                     **summarize_group(group, names)})
+    pd.DataFrame(rows).to_csv(output / "summary_class_pairs.csv", index=False)
+    # Equal-weight each class-pair type, in addition to pooled scenario summaries.
+    pair = pd.DataFrame(rows)
+    for family, key in (("level", "sir_db"), ("duration", "fraction")):
+        pair[pair.family == family].groupby(key)[["all_present_recall", "exact_match", "retention_all"]].mean().to_csv(output / f"macro_pair_{family}.csv")
+    return frame, tables
+
+
+def run(output=OUTPUT, threads=8, limit=None):
+    output = Path(output)
+    started = time.perf_counter()
+    experiment = Experiment(output, threads)
+    baseline = experiment.baseline()
+    planned = experiment.scenes if limit is None else experiment.scenes[:limit]
+    complete = set()
+    path = output / "scenarios.csv"
+    if path.exists():
+        complete = set(pd.read_csv(path).scenario_id)
+    try:
+        with path.open("a", newline="", encoding="utf-8") as destination:
+            writer = None
+            for i, scene in enumerate(planned, 1):
+                if scene["scenario_id"] not in complete:
+                    row = experiment.evaluate_scene(scene)
+                    if writer is None:
+                        writer = csv.DictWriter(destination, fieldnames=list(row))
+                        if destination.tell() == 0:
+                            writer.writeheader()
+                    writer.writerow(row)
+                    destination.flush()
+                if i == 1 or i % 25 == 0 or i == len(planned):
+                    print(f"[{i}/{len(planned)}] scenarios; {experiment.inferences} new CPU forward passes; "
+                          f"elapsed {time.perf_counter() - started:.0f}s; RSS {experiment.process.memory_info().rss / 2**30:.2f} GiB", flush=True)
+        if limit is None:
+            experiment.save_examples()
+    finally:
+        experiment.cache_file.close()
+    frame, tables = summarize(output)
+    memory = experiment.process.memory_info()
+    previous = json.loads((output / "run.json").read_text()) if (output / "run.json").exists() else {}
+    max_difference = float(baseline.max_gain_control_score_difference.max())
+    metadata = {"limitation": cpu.LIMITATION, "recipe_version": RECIPE_VERSION,
+                "n_source_recordings": len(experiment.table), "n_cross_class_pairs": 251,
+                "n_scenarios": len(frame), "n_planned_scenarios": len(experiment.scenes),
+                "complete": len(frame) == len(experiment.scenes), "partial_run": limit is not None,
+                "cached_forward_passes": len(experiment.cache), "new_forward_passes_this_run": experiment.inferences,
+                "undefined_control_cache_entries": len(experiment.undefined_controls),
+                "elapsed_seconds_this_run": time.perf_counter() - started,
+                "initial_run_elapsed_seconds": previous.get("initial_run_elapsed_seconds", time.perf_counter() - started),
+                "peak_rss_gib": max(getattr(memory, "peak_wset", memory.rss), experiment.max_rss) / 2**30,
+                "audio_cache_mib": sum(x.numel() * x.element_size() for x in experiment.audio) / 2**20,
+                "original_argmax_accuracy": float((baseline.original_argmax == baseline["class"]).mean()),
+                "gain_matched_argmax_accuracy": float((baseline.scaled_argmax == baseline["class"]).mean()),
+                "max_score_change_from_common_gain": max_difference,
+                "packages": {p: importlib.metadata.version(p) for p in ["torch", "torchaudio", "torchvision", "fastai", "numpy", "pandas", "nbformat", "nbclient", "ipykernel", "psutil"]},
+                "training_note": "Upstream notebook uses MixUp on spectrogram inputs; waveform mixing is a distinct perturbation.",
+                "statistical_note": "Scenarios reuse recordings and sometimes vessels. No independent-trial significance tests or confidence intervals.",
+                "signal_note": "Levels use mean-subtracted recording RMS, not calibrated isolated-vessel sound power. Background noises are mixed too.",
+                "temporal_note": "Active-interval AC SIR is held at 0 dB for partial overlaps; same centred B fragment is moved for placement comparisons."}
+    cpu.save_json(output / "run.json", metadata)
+    print(json.dumps(metadata, indent=2), flush=True)
+    return frame, tables, metadata
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=OUTPUT)
+    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--limit", type=int)
+    args = parser.parse_args()
+    run(args.output, args.threads, args.limit)

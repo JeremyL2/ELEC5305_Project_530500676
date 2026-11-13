@@ -1,0 +1,61 @@
+{
+  "recipe_version": 1,
+  "script_sha256": "ae5ffbe3254166ae670c97319feeac402000caf7871bc322316ec4fef4fd5394",
+  "adapter_sha256": "8494a6c2837e8376907e9c9fcffbdbd71bc3cecb5d963091b95e700eedbac723",
+  "checkpoint_sha256": "f8cbc4dc72c62fd724780aae7d59b732d06a9976dc9f9a03445e449f9fadfe11",
+  "source_hashes": {
+    "Cargo/103.wav": "a90dd2a867674521867b7cd48a23a1d649d8fc3dceff614fa0e73094b857b4be",
+    "Cargo/110.wav": "68953fdc86accd13d0528aa21f5ec6b31ce4c6d04388845393c51e7bf57cecef",
+    "Cargo/15.wav": "a899976dfb3187e81b87825587fbad2593d8621aef871677d828215e6628cda4",
+    "Cargo/27.wav": "cdf54f9b1ae2cc9e9b2e455a4d4219deabe24ab5710ea5af0e9e54467b07d532",
+    "Cargo/38.wav": "8d7a6b085ec4534cfdc431a8fe193f27b13ef33b9704113b1acedcd1dd66c2d1",
+    "Cargo/41.wav": "21110d18a533fc904edcc3dca22c5dc6f946bf3e32b4075d71dce04eba12339c",
+    "Cargo/44.wav": "50ebadbed85f2760e85f0ed01a534d40df0fa81b2e0aa2be982406ab268344a5",
+    "Cargo/62.wav": "3edadf795b0d61a935542f8280c9ab105e04be32ba261d45cb1642c16a202c61",
+    "Cargo/69.wav": "eb17ff793300b4e735d2016e6a688e310af6660a25c111656a072e2632dcb70f",
+    "Cargo/78.wav": "296a41550ba23815b96410ff633e5d7ac21ae14a420a22ed8cea9cebf315a080",
+    "Cargo/96.wav": "2f445f3807e0cd53dc8a7089753d335f1f7e79d21db4b960f5c72cbeca516253",
+    "Cargo/99.wav": "dc82b135a09aaf399a865ab5bb27013de0b7eca674aac0861839e00008ee6352",
+    "Passengership/23.wav": "c4ba2930fd45f4a6a7ebce5bbf816eabfb527af536a0e9c14b42fcc051df1e6d",
+    "Passengership/33.wav": "319ba2b5a909dd69fe083c84e96cb2be947c45b927b61db1a26d855fc2ec369c",
+    "Passengership/37.wav": "074fd056abd3e0d1422a8c0ff3da6d4fbae3637d17fc36f2fc159c37c5f61844",
+    "Passengership/4.wav": "8fc13439efbb5533ccc14f4407efdf2a42d40bc0d0cc159e03daf4c58fa0a236",
+    "Passengership/50.wav": "87a00621488f9ea056aa47c856a06af007c988eaa8ddb025cf33f0a799515d3a",
+    "Tanker/13.wav": "8dc08d9c73a88e116f6722712d49a0b857706bfae4e283622ba8fd511098ab13",
+    "Tanker/2.wav": "e50c98b4abeeab67298287d207804434d67dd824fd688dee227f5cb5144b8e15",
+    "Tanker/20.wav": "fe3c6fa6482b9e3959c91357067e4d0d04a44db0eb2515b5042cd1f9ad5fdbb2",
+    "Tanker/29.wav": "c7d369c1bc89c5da6a881365fd1ddaee612e26a3c72510449e62849941111906",
+    "Tanker/38.wav": "55a99e711964804cdb257a35353c2966e8d576dc8fc148d20da6440174336f18",
+    "Tanker/39.wav": "98634f991cfb2b155a7cb54573df1c4250259e64fe3717568263082ecddeee01",
+    "Tanker/6.wav": "83763c6f33b3265526c023ae8ae4ca18c7e9f894015de03a042ebcb228e7409a",
+    "Tug/40.wav": "e0452e30f70aaf8e9e0f39321d646c1f2c777ff80c970ae9fe0f28bdd5e86469",
+    "Tug/49.wav": "a934e2a771e3d7ced7ee155497b29368739085c3dea7e1c596157c07101c059f",
+    "Tug/9.wav": "a2adde208a9c2756b7dc7e17f8838c800dc4d30cd5f5969bef3b79a06419c2d0"
+  },
+  "class_names": [
+    "Cargo",
+    "Passengership",
+    "Tanker",
+    "Tug"
+  ],
+  "ratios_db": [
+    -12,
+    -6,
+    0,
+    6,
+    12
+  ],
+  "fractions": [
+    0,
+    0.25,
+    0.5,
+    0.75,
+    1
+  ],
+  "fade_samples": 640,
+  "headroom": 0.004638635624719501,
+  "threads": 8,
+  "threshold": 0.5,
+  "sample_rate": 32000,
+  "window_samples": 3007827
+}

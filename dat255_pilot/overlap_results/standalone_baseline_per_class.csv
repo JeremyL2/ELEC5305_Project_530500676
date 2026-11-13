@@ -1,0 +1,9 @@
+Group,Class,precision,recall,f1-score,support,Independent recall @0.5,Independent F1 @0.5
+All available recordings,Cargo,1.0,1.0,1.0,12.0,1.0,1.0
+All available recordings,Passengership,0.95,0.95,0.95,20.0,0.95,0.95
+All available recordings,Tanker,0.9642857142857143,0.9642857142857143,0.9642857142857143,28.0,0.9642857142857143,0.9818181818181818
+All available recordings,Tug,1.0,1.0,1.0,3.0,1.0,1.0
+Native length: mixture sources,Cargo,1.0,1.0,1.0,12.0,1.0,1.0
+Native length: mixture sources,Passengership,1.0,0.8,0.8888888888888888,5.0,0.8,0.8888888888888888
+Native length: mixture sources,Tanker,0.875,1.0,0.9333333333333333,7.0,1.0,1.0
+Native length: mixture sources,Tug,1.0,1.0,1.0,3.0,1.0,1.0

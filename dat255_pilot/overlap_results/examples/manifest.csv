@@ -1,0 +1,10 @@
+family,a,b,sir_db,fraction,position,pair_class,scenario_id,path,sha256
+level,0,12,0,1.0,centre,Cargo + Passengership,scene_00002,examples/scene_00002.wav,2f63455930ed0b01f98d58f7b7168e2a527d29c236999ac5877a1c158fafe2a2
+level,0,17,0,1.0,centre,Cargo + Tanker,scene_00052,examples/scene_00052.wav,ab2b5dc0457bfcd6a258818683c952966338b7030483ba6a8ed8018501d8c4b6
+level,0,24,0,1.0,centre,Cargo + Tug,scene_00122,examples/scene_00122.wav,bcefc1874c492dc4b26d820669029bf077ff1c5631abf1675f8a934520c70a00
+level,12,17,0,1.0,centre,Passengership + Tanker,scene_01802,examples/scene_01802.wav,246597c865a719f9cb7af738b0869ce4ab158571d8571af62910e1d51a221da0
+level,12,24,0,1.0,centre,Passengership + Tug,scene_01872,examples/scene_01872.wav,ee0a788c7b8225a417936d8ecdbeca486253c271499feaee2d61641958f35177
+level,17,24,0,1.0,centre,Tanker + Tug,scene_02302,examples/scene_02302.wav,4bdbb83a026646b2dd772b9b71352cbd42688fd2c3c2a28bfb3d49ffe2b78b31
+duration,0,12,0,0.25,centre,Cargo + Passengership,scene_00006,examples/scene_00006.wav,547186fc16f20526335d911b9d3683682b4ac4d8093484e98287b90063b05329
+duration,0,12,0,0.5,centre,Cargo + Passengership,scene_00007,examples/scene_00007.wav,bd5e4cf9c6e4b29864c5f4634189970c3841b759b0c9c452056fcab983ff20ea
+duration,0,12,0,0.75,centre,Cargo + Passengership,scene_00008,examples/scene_00008.wav,27f9291d879daa3c660151504efe22cbd92a585ed15b4d647c4b4825dc3650b2
